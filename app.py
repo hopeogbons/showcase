@@ -75,53 +75,11 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "get_customer",
-            "description": "Get customer information by ID. Use to look up customer details, verify shipping address, or check customer role/permissions.",
+            "name": "list_my_orders",
+            "description": "List the logged-in customer's orders. Use to view order history or track orders. Only shows orders belonging to the current customer.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "customer_id": {
-                        "type": "string",
-                        "description": "Customer UUID"
-                    }
-                },
-                "required": ["customer_id"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "verify_customer_pin",
-            "description": "Verify customer identity with email and PIN. Use to authenticate customer before order placement, verify identity for account access, or simple security check.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "email": {
-                        "type": "string",
-                        "description": "Customer email address"
-                    },
-                    "pin": {
-                        "type": "string",
-                        "description": "4-digit PIN code"
-                    }
-                },
-                "required": ["email", "pin"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_orders",
-            "description": "List orders with optional filters. Use to view customer order history, track pending orders, analyze order patterns, or find orders by status.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "customer_id": {
-                        "type": "string",
-                        "description": "Filter by customer UUID"
-                    },
                     "status": {
                         "type": "string",
                         "description": "Filter by status (draft|submitted|approved|fulfilled|cancelled)"
@@ -134,8 +92,8 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "get_order",
-            "description": "Get detailed order information including items. Use to view order details, check order contents, or analyze what products are ordered together.",
+            "name": "get_my_order",
+            "description": "Get detailed information for one of the logged-in customer's orders. Only works for orders belonging to the current customer.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -151,15 +109,11 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "create_order",
-            "description": "Create a new order with items. Order starts in 'submitted' status with 'pending' payment. Automatically decrements inventory.",
+            "name": "create_my_order",
+            "description": "Create a new order for the logged-in customer. Order starts in 'submitted' status with 'pending' payment. Automatically decrements inventory.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "customer_id": {
-                        "type": "string",
-                        "description": "Customer UUID"
-                    },
                     "items": {
                         "type": "array",
                         "description": "List of items with sku, quantity, unit_price, and currency",
@@ -175,7 +129,7 @@ TOOLS = [
                         }
                     }
                 },
-                "required": ["customer_id", "items"]
+                "required": ["items"]
             }
         }
     }
@@ -185,24 +139,24 @@ TOOLS = [
 SYSTEM_PROMPT = """You are a helpful customer service assistant for an electronics retail company. You help customers with:
 
 1. **Product Discovery**: Browse products, search by keywords, get detailed product information
-2. **Customer Lookup**: Retrieve customer information (requires customer ID or email verification)
-3. **Order Management**: View order history, check order details, create new orders
+2. **Order Management**: View their order history, check order details, create new orders
 
 ## Important Guidelines:
 
-### Authentication Flow:
-- Before creating orders or accessing sensitive customer data, verify the customer using their email and PIN
-- Once verified, you'll have their customer_id for subsequent operations
+### Security Note:
+- The customer is already logged in and authenticated
+- You can only access THEIR orders - use list_my_orders, get_my_order, and create_my_order
+- These tools automatically use the logged-in customer's ID - you don't need to provide it
 
 ### Product Assistance:
 - When customers ask about products, use search_products for keyword searches
 - Use list_products to show categories or browse inventory
 - Use get_product with SKU for specific product details
 
-### Order Creation Flow:
-1. First verify the customer (verify_customer_pin)
-2. Help them find products (search_products, list_products, get_product)
-3. Create the order with their customer_id and selected items
+### Order Management:
+- Use list_my_orders to show the customer's order history
+- Use get_my_order to show details of a specific order
+- Use create_my_order to place a new order (customer_id is automatic)
 
 ### Response Style:
 - Be friendly and professional
@@ -250,20 +204,46 @@ def authenticate_customer(email: str, pin: str) -> bool:
         return False
 
 
-def get_customer_id_from_session(email: str) -> str | None:
-    """Get customer_id by calling get_customer after verification."""
-    # We need to extract customer_id - call verify again to get full details
-    payload = {
-        "jsonrpc": "2.0",
-        "method": "tools/call",
-        "params": {
-            "name": "verify_customer_pin",
-            "arguments": {"email": email, "pin": customer_sessions.get(email, {}).get("pin", "")}
-        },
-        "id": 1
-    }
-    # For now, we'll let the LLM handle customer_id extraction during chat
-    return customer_sessions.get(email, {}).get("info", "")
+def extract_customer_id(customer_info: str) -> str | None:
+    """Extract customer_id from customer info string."""
+    if "Customer ID:" in customer_info:
+        # Format: "Customer ID: 41c2903a-f1a5-47b7-a81d-86b50ade220f"
+        for line in customer_info.split("\n"):
+            if "Customer ID:" in line:
+                return line.split("Customer ID:")[1].strip()
+    return None
+
+
+def call_secure_tool(tool_name: str, arguments: dict, customer_id: str) -> str:
+    """Call order-related tools with automatic customer_id injection and validation."""
+
+    if tool_name == "list_my_orders":
+        # Always filter by the logged-in customer's ID
+        return call_mcp_tool("list_orders", {
+            "customer_id": customer_id,
+            "status": arguments.get("status")
+        })
+
+    elif tool_name == "get_my_order":
+        # First get the order, then verify it belongs to this customer
+        order_id = arguments.get("order_id")
+        result = call_mcp_tool("get_order", {"order_id": order_id})
+
+        # Check if the order belongs to this customer
+        if f"Customer ID: {customer_id}" in result:
+            return result
+        else:
+            return "Error: You don't have permission to view this order."
+
+    elif tool_name == "create_my_order":
+        # Automatically inject the customer_id
+        return call_mcp_tool("create_order", {
+            "customer_id": customer_id,
+            "items": arguments.get("items", [])
+        })
+
+    # For non-order tools, call normally
+    return call_mcp_tool(tool_name, arguments)
 
 
 def call_mcp_tool(tool_name: str, arguments: dict) -> str:
@@ -344,13 +324,22 @@ def chat(message: str, history: list, customer_info: str = "") -> str:
             ]
         })
 
+        # Extract customer_id for secure tool calls
+        customer_id = extract_customer_id(customer_info) if customer_info else None
+
         # Execute each tool call and add results
         for tool_call in assistant_message.tool_calls:
             tool_name = tool_call.function.name
             arguments = json.loads(tool_call.function.arguments)
 
-            # Call the MCP tool
-            tool_result = call_mcp_tool(tool_name, arguments)
+            # Use secure wrapper for order-related tools
+            if tool_name in ["list_my_orders", "get_my_order", "create_my_order"]:
+                if customer_id:
+                    tool_result = call_secure_tool(tool_name, arguments, customer_id)
+                else:
+                    tool_result = "Error: You must be logged in to access orders."
+            else:
+                tool_result = call_mcp_tool(tool_name, arguments)
 
             messages.append({
                 "role": "tool",
