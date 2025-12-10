@@ -3,7 +3,7 @@ import requests
 import json
 import os
 from dotenv import load_dotenv
-from openai import OpenAI
+from langfuse.openai import OpenAI
 
 # Load environment variables from .env file
 load_dotenv()
@@ -12,7 +12,8 @@ load_dotenv()
 MCP_URL = "https://vipfapwm3x.us-east-1.awsapprunner.com/mcp"
 MCP_HEADERS = {"Content-Type": "application/json", "Accept": "application/json"}
 
-# OpenAI Client
+# OpenAI Client with LangFuse tracing (auto-configured from env vars)
+# LangFuse reads LANGFUSE_SECRET_KEY, LANGFUSE_PUBLIC_KEY, LANGFUSE_BASE_URL automatically
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Define tools for OpenAI function calling
@@ -295,7 +296,7 @@ def chat(message: str, history: list, customer_info: str = "") -> str:
 
     messages.append({"role": "user", "content": message})
 
-    # Call OpenAI with tools
+    # Call OpenAI with tools (LangFuse auto-traces via the wrapped client)
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=messages,
@@ -325,7 +326,7 @@ def chat(message: str, history: list, customer_info: str = "") -> str:
         })
 
         # Extract customer_id for secure tool calls
-        customer_id = extract_customer_id(customer_info) if customer_info else None
+        cust_id = extract_customer_id(customer_info) if customer_info else None
 
         # Execute each tool call and add results
         for tool_call in assistant_message.tool_calls:
@@ -334,8 +335,8 @@ def chat(message: str, history: list, customer_info: str = "") -> str:
 
             # Use secure wrapper for order-related tools
             if tool_name in ["list_my_orders", "get_my_order", "create_my_order"]:
-                if customer_id:
-                    tool_result = call_secure_tool(tool_name, arguments, customer_id)
+                if cust_id:
+                    tool_result = call_secure_tool(tool_name, arguments, cust_id)
                 else:
                     tool_result = "Error: You must be logged in to access orders."
             else:
