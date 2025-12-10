@@ -213,6 +213,59 @@ SYSTEM_PROMPT = """You are a helpful customer service assistant for an electroni
 You have access to tools that connect to the company's inventory and order management system. Use them to provide accurate, real-time information."""
 
 
+# Store authenticated customer data per session
+customer_sessions = {}
+
+
+def authenticate_customer(email: str, pin: str) -> bool:
+    """Authenticate customer using MCP verify_customer_pin tool."""
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "verify_customer_pin",
+            "arguments": {"email": email, "pin": pin}
+        },
+        "id": 1
+    }
+
+    try:
+        response = requests.post(MCP_URL, headers=MCP_HEADERS, json=payload, timeout=30)
+        result = response.json()
+
+        if "error" in result:
+            return False
+
+        # Check if verification was successful (not an error response)
+        content = result.get("result", {}).get("content", [{}])[0].get("text", "")
+        if "verified" in content.lower() or ("Customer ID:" in content and "Email:" in content):
+            # Store the customer info for the session
+            customer_sessions[email] = {
+                "email": email,
+                "info": content
+            }
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def get_customer_id_from_session(email: str) -> str | None:
+    """Get customer_id by calling get_customer after verification."""
+    # We need to extract customer_id - call verify again to get full details
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {
+            "name": "verify_customer_pin",
+            "arguments": {"email": email, "pin": customer_sessions.get(email, {}).get("pin", "")}
+        },
+        "id": 1
+    }
+    # For now, we'll let the LLM handle customer_id extraction during chat
+    return customer_sessions.get(email, {}).get("info", "")
+
+
 def call_mcp_tool(tool_name: str, arguments: dict) -> str:
     """Call a tool on the MCP server."""
     payload = {
@@ -237,10 +290,15 @@ def call_mcp_tool(tool_name: str, arguments: dict) -> str:
         return f"Error calling tool: {str(e)}"
 
 
-def chat(message: str, history: list) -> str:
+def chat(message: str, history: list, customer_info: str = "") -> str:
     """Process a chat message and return a response."""
+    # Build system prompt with customer context if available
+    system_content = SYSTEM_PROMPT
+    if customer_info:
+        system_content += f"\n\n## Logged-in Customer Information:\n{customer_info}\n\nThe customer is already authenticated. Use their information for orders and lookups. You don't need to verify them again."
+
     # Build messages from history
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages = [{"role": "system", "content": system_content}]
 
     for h in history:
         # Handle both dict format (Gradio 6.x) and tuple format
@@ -314,46 +372,130 @@ def chat(message: str, history: list) -> str:
 
 # Create Gradio interface
 with gr.Blocks(title="Customer Service Assistant") as demo:
+    # State to store customer info after login
+    customer_state = gr.State(value="")
+
     gr.Markdown(
         """
         # 🛒 Customer Service Assistant
 
         Welcome! I can help you with:
         - **Browse Products**: Search our catalog, check availability and prices
-        - **Account Access**: Verify your identity with email and PIN
         - **Order Management**: View your orders or place new ones
 
-        Just type your question below!
+        Please log in with your email and PIN to get started.
         """
     )
 
-    chatbot = gr.Chatbot(
-        height=500,
-        label="Chat"
-    )
+    # Login section
+    with gr.Group() as login_group:
+        gr.Markdown("### Login")
+        with gr.Row():
+            email_input = gr.Textbox(
+                placeholder="Enter your email",
+                label="Email",
+                scale=2
+            )
+            pin_input = gr.Textbox(
+                placeholder="Enter your 4-digit PIN",
+                label="PIN",
+                type="password",
+                scale=1
+            )
+            login_btn = gr.Button("Login", variant="primary", scale=1)
+        login_status = gr.Markdown("")
 
-    with gr.Row():
-        msg = gr.Textbox(
-            placeholder="Type your message here...",
-            label="Your Message",
-            scale=4,
-            show_label=False
+    # Chat section (initially hidden)
+    with gr.Group(visible=False) as chat_group:
+        welcome_msg = gr.Markdown("")
+
+        chatbot = gr.Chatbot(
+            height=400,
+            label="Chat"
         )
-        submit = gr.Button("Send", variant="primary", scale=1)
 
-    clear = gr.Button("Clear Chat")
+        with gr.Row():
+            msg = gr.Textbox(
+                placeholder="Type your message here...",
+                label="Your Message",
+                scale=4,
+                show_label=False
+            )
+            submit = gr.Button("Send", variant="primary", scale=1)
 
-    def respond(message, chat_history):
+        with gr.Row():
+            clear = gr.Button("Clear Chat")
+            logout_btn = gr.Button("Logout", variant="secondary")
+
+    def login(email, pin):
+        if not email or not pin:
+            return (
+                gr.update(),  # login_group
+                gr.update(),  # chat_group
+                "⚠️ Please enter both email and PIN",  # login_status
+                "",  # customer_state
+                gr.update(),  # welcome_msg
+            )
+
+        if authenticate_customer(email, pin):
+            customer_info = customer_sessions.get(email, {}).get("info", "")
+            # Extract customer name from info
+            name = "Customer"
+            if "verified:" in customer_info:
+                # Format: "✓ Customer verified: Donald Garcia"
+                name = customer_info.split("verified:")[1].split("\n")[0].strip()
+            elif "Customer:" in customer_info:
+                name = customer_info.split("Customer:")[1].split("\n")[0].strip()
+
+            return (
+                gr.update(visible=False),  # login_group
+                gr.update(visible=True),   # chat_group
+                "",  # login_status
+                customer_info,  # customer_state
+                f"### Welcome, {name}! 👋\nHow can I help you today?",  # welcome_msg
+            )
+        else:
+            return (
+                gr.update(),  # login_group
+                gr.update(),  # chat_group
+                "❌ Invalid email or PIN. Please try again.",  # login_status
+                "",  # customer_state
+                gr.update(),  # welcome_msg
+            )
+
+    def logout():
+        return (
+            gr.update(visible=True),   # login_group
+            gr.update(visible=False),  # chat_group
+            "",  # login_status
+            "",  # customer_state
+            "",  # welcome_msg
+            [],  # chatbot
+            "",  # email_input
+            "",  # pin_input
+        )
+
+    def respond(message, chat_history, customer_info):
         if not message.strip():
             return "", chat_history
-        bot_message = chat(message, chat_history)
+        bot_message = chat(message, chat_history, customer_info)
         chat_history.append({"role": "user", "content": message})
         chat_history.append({"role": "assistant", "content": bot_message})
         return "", chat_history
 
-    msg.submit(respond, [msg, chatbot], [msg, chatbot])
-    submit.click(respond, [msg, chatbot], [msg, chatbot])
+    login_btn.click(
+        login,
+        inputs=[email_input, pin_input],
+        outputs=[login_group, chat_group, login_status, customer_state, welcome_msg]
+    )
+
+    msg.submit(respond, [msg, chatbot, customer_state], [msg, chatbot])
+    submit.click(respond, [msg, chatbot, customer_state], [msg, chatbot])
     clear.click(lambda: [], None, chatbot, queue=False)
+    logout_btn.click(
+        logout,
+        outputs=[login_group, chat_group, login_status, customer_state, welcome_msg, chatbot, email_input, pin_input]
+    )
 
 
 if __name__ == "__main__":
